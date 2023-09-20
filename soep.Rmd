@@ -1,0 +1,236 @@
+---
+title: "soep"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+  pdf_document:
+    toc: yes
+date: "2023-07-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Include libraries
+```{r include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(stringr)
+library(ctsem)
+library(ctsemOMX)
+```
+
+# Load data
+
+```{r}
+soep = readRDS("C:/Users/Linus Widmer/Documents/HU/FM9_Statistics/SOEP-CORE.v37eu_R_EN/R_EN/pl.rds")
+biobirth = readRDS("C:/Users/Linus Widmer/Documents/HU/FM9_Statistics/SOEP-CORE.v37eu_R_EN/R_EN/biobirth.rds")
+```
+
+# General Data preparation
+
+Filter for BFI items
+```{r}
+subset_bf <- soep[, c("pid", "syear", "plh0212", "plh0213", "plh0214", "plh0215", "plh0216",
+                      "plh0217", "plh0218", "plh0219", "plh0220", "plh0221", 
+                      "plh0222", "plh0223", "plh0224", "plh0226")]
+```
+
+Remove all participants, that have missing data in their item responses
+```{r}
+subset_bf_complete = subset_bf[apply(subset_bf, 1, function(x) all(x >= 0)), ]
+```
+
+```{r}
+nrow(subset_bf) - nrow(subset_bf_complete)
+nrow(subset_bf_complete)
+```
+since the soep dataset is huge and has been assessed since the 90s, a lot of rows get eliminated, as the BFI has first been assessed in 2005.
+we are left with 120170 observations. this does not mean we have 120170 participants, since our data is still in wide format and participants have been assessed multiple times.
+
+
+For the further analysis we will only look at the construct conscientiousness which has 3 items:
+- plh0212
+- plh0218
+- plh0222
+
+In order to calculate the scale we also have to first recode the item plh0218
+Calculating the scale
+```{r}
+subset_bf_complete = as.data.frame(sapply(subset_bf_complete, haven::zap_labels))
+subset_bf_complete$plh0218_r = 8 - as.numeric(subset_bf_complete$plh0218)
+subset_bf_complete$consc = (subset_bf_complete$plh0212 + subset_bf_complete$plh0222 + subset_bf_complete$plh0218_r) /3
+```
+
+
+```{r}
+df_consc_long = subset_bf_complete[, c("pid", "syear", "consc")]
+df_consc_long <- df_consc_long %>%
+  group_by(pid) %>%
+  filter(n() >= 5) %>%
+  ungroup()
+df_consc_long = merge(df_consc_long, biobirth[, c("pid", "gebjahr")], by = "pid")
+df_consc_long$time = df_consc_long$syear - 2005
+df_consc_long$min_age = 2005 - df_consc_long$gebjahr
+df_consc_long$age = df_consc_long$syear - df_consc_long$gebjahr
+```
+
+# Descriptive statistics
+
+mean and standard deviation of consc for every survey year
+
+```{r}
+df_consc_long %>%
+  group_by(syear) %>%
+  summarise(mean_consc = mean(consc),
+            sd_consc = sd(consc))
+```
+mean and standard deviation of conscientiousness for every age group
+
+```{r}
+df_consc_long %>%
+  group_by(age) %>%
+  summarise(mean_consc = mean(consc),
+            sd_consc = sd(consc))
+```
+
+mean and sd of age per survey year
+```{r}
+df_consc_long %>%
+  group_by(syear) %>%
+  summarise(mean_age = mean(age),
+            sd_age = sd(age))
+```
+of course here the mean age for each survey year is rising, as i include only people who have completed all 5 waves. Is this a problem?
+
+
+Visualization: cross sectional trend of conscientiousness over the life span
+```{r}
+consc_age_aggregated <- df_consc_long %>%
+  group_by(age) %>%
+  summarize(mean_value = mean(consc, na.rm = TRUE))
+
+ggplot(consc_age_aggregated, aes(x = age, y = mean_value)) +
+  geom_line() +
+  xlab("Age") +
+  ylab("Conscientiousness") +
+  ggtitle("Mean Value Conscientiousness by Age")
+```
+
+we can really nicely see how conscientiousness is rising until the 30s and then sort of reaches
+a plateau. After 75 years the onservations seem a bit unstable
+
+How many observations per age group
+```{r}
+hist(df_consc_long$age)
+```
+```{r}
+table(df_consc_long$age)
+```
+
+I set the cutoff that n has to be at least 100, meaning i will constrain my dataset
+between age ranges 24 and 83
+
+
+# Continuous time SEM
+
+After some 
+deliberations on how to specify the model, we will 
+compute models compare them
+choose final model
+interpret model parameters
+
+for stanct we need the data in a long format, with an id per person and we want to save our
+time independent predictor, which will be the mean age of all the assessments a person has 
+completed, and our dependent variable consciousness
+
+
+## ct Model data preparation
+
+adding a quadratic factor and z-standardization
+```{r}
+df_consc_long$min_agesq = df_consc_long$min_age ^2
+
+df_consc_long$min_age_z = (df_consc_long$min_age - mean(df_consc_long$min_age)) / sd(df_consc_long$min_age)
+df_consc_long$min_agesq_z = (df_consc_long$min_agesq - mean(df_consc_long$min_agesq)) / sd(df_consc_long$min_agesq)
+
+```
+
+## Estimating Models
+
+### Linear Model
+
+```{r}
+model_ct_consc_TIage_lin <- ctModel(type='stanct', Tpoints = 5,
+               LAMBDA = matrix(c(1), nrow = 1, ncol = 1),
+               MANIFESTVAR=diag(0, 1), 
+               manifestNames = c("consc"),  n.manifest=1,
+               id = "pid",
+               n.latent=1,
+               TRAITVAR = "auto", # accounting for unobserved heterogeneity
+               n.TIpred=1, TIpredNames=c("min_age_z"))
+model_ct_consc_TIage_lin$pars$indvarying[3] = TRUE # allowing for predictor dependent model coefficients
+```
+
+```{r include=FALSE}
+fit_ct_consc_TIage_lin = ctStanFit(df_consc_long, model_ct_consc_TIage_lin)
+```
+
+## Quadratic Model
+
+Specifying the model
+```{r include=FALSE}
+model_ct_consc_TIage_sq <- ctModel(type='stanct', Tpoints = 5,
+               LAMBDA = matrix(c(1), nrow = 1, ncol = 1),
+               MANIFESTVAR=diag(0, 1), 
+               manifestNames = c("consc"),  n.manifest=1,
+               id = "pid",
+               n.latent=1,
+               T0VAR = diag(1),
+               TRAITVAR = "auto",
+               n.TIpred=2, TIpredNames=c("min_age_z", "min_age sq_z"))
+model_ct_consc_TIage_sq$pars$indvarying[3] = TRUE # allows for 
+```
+
+
+```{r}
+fit_ct_consc_TIage_sq = ctStanFit(df_consc_long, model_ct_consc_TIage_sq)
+```
+## Model comparison
+
+comparing the linear and quadratic term models using a likelihood ratio test
+```{r}
+ctChisqTest(fit_ct_consc_TIage_lin, fit_ct_consc_TIage_sq)
+```
+
+The chi-sq test of the likelihood of our models is hihgly significant. this means that adding a quadratic term for our time independent predictor fits the data significantly better!
+We choose this model now for interpretation of its parameters.
+
+
+## Interpretation of model parameters
+
+```{r}
+summary(fit_ct_consc_TIage_sq)$parmatrices
+```
+
+```{r}
+summary(fit_ct_consc_TIage_sq, verbose = T)
+```
+
+
+```{r}
+ctStanTIpredeffects(fit_ct_consc_TIage_sq, whichpars = c("DRIFT[1,1]", "dtDRIFT[1,1]"), plot = TRUE)
+```
+here we can see the continuous time (DRIFT) drift coefficient and the discrete time drift coefficient (dtDRIFT).
+The dtDrift is just a transformation of the DRIFT coefficient but may be easier to interpret in substantive terms: The lower the dtDRIFT, the higher is the stability of a process and the higher is the autoregresson.
+Here we can see that with in increasing age, the dtDRIFT gets smaller and we have a more stable process.
+This is inline with the findings of Lucas and Donnellan, who also observed a higher stability in conscientiousness as people get older.
+
+```{r}
+ctStanTIpredeffects(fit_ct_consc_TIage_sq, whichpars = c("MANIFESTMEANS[1,1]", "T0MEANS[1,1]"), plot = TRUE)
+```
+in this plot we can see that with an increasing age also the mean of our dependent variable conscientiousness rises. this is congruent with our descriptive statistics, although i would have expected that there is an asymptotic curve because there is little change of the conscientiousness after the age of 40.
+
